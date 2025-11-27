@@ -2,117 +2,111 @@
 #
 # Launch a Ray cluster inside Docker for vLLM inference.
 #
-# This script can start either a head node or a worker node, depending on the
-# --head or --worker flag provided as the third positional argument.
-#
 # Usage:
-# 1. Designate one machine as the head node and execute:
-#    bash run_cluster.sh \
-#         vllm/vllm-openai \
-#         <head_node_ip> \
-#         --head \
-#         /abs/path/to/huggingface/cache \
-#         -e VLLM_HOST_IP=<head_node_ip>
+#  bash run_cluster.sh <docker_image> <head_node_ip> --head|--worker <abs_path_to_hf_home> [additional_args...]
+# Example:
+#  sudo bash run_cluster.sh vllm/vllm-openai:nightly-x86_64 192.168.0.101 --head /home/nima_ka/.cache/huggingface/hub -e VLLM_HOST_IP=192.168.0.101
 #
-# 2. On every worker machine, execute:
-#    bash run_cluster.sh \
-#         vllm/vllm-openai \
-#         <head_node_ip> \
-#         --worker \
-#         /abs/path/to/huggingface/cache \
-#         -e VLLM_HOST_IP=<worker_node_ip>
-# 
-# Each worker requires a unique VLLM_HOST_IP value.
-# Keep each terminal session open. Closing a session stops the associated Ray
-# node and thereby shuts down the entire cluster.
-# Every machine must be reachable at the supplied IP address.
-#
-# The container is named "node-<random_suffix>". To open a shell inside
-# a container after launch, use:
-#       docker exec -it node-<random_suffix> /bin/bash
-#
-# Then, you can execute vLLM commands on the Ray cluster as if it were a
-# single machine, e.g. vllm serve ...
-#
-# To stop the container, use:
-#       docker stop node-<random_suffix>
+set -euo pipefail
 
-# Check for minimum number of required arguments.
 if [ $# -lt 4 ]; then
     echo "Usage: $0 docker_image head_node_ip --head|--worker path_to_hf_home [additional_args...]"
     exit 1
 fi
 
-# Extract the mandatory positional arguments and remove them from $@.
 DOCKER_IMAGE="$1"
 HEAD_NODE_ADDRESS="$2"
-NODE_TYPE="$3"  # Should be --head or --worker.
+NODE_TYPE="$3"  # --head or --worker
 PATH_TO_HF_HOME="$4"
 shift 4
 
-# Preserve any extra arguments so they can be forwarded to Docker.
 ADDITIONAL_ARGS=("$@")
 
-# Validate the NODE_TYPE argument.
 if [ "${NODE_TYPE}" != "--head" ] && [ "${NODE_TYPE}" != "--worker" ]; then
     echo "Error: Node type must be --head or --worker"
     exit 1
 fi
 
-# Generate a unique container name with random suffix.
-# Docker container names must be unique on each host.
-# The random suffix allows multiple Ray containers to run simultaneously on the same machine,
-# for example, on a multi-GPU machine.
+# Require absolute path for HF cache (tilde won't expand under sudo reliably).
+if [[ "${PATH_TO_HF_HOME}" != /* ]]; then
+    echo "Error: path_to_hf_home must be absolute. Got: ${PATH_TO_HF_HOME}"
+    exit 1
+fi
+
 CONTAINER_NAME="node-${RANDOM}"
 
-# Define a cleanup routine that removes the container when the script exits.
-# This prevents orphaned containers from accumulating if the script is interrupted.
 cleanup() {
-    docker stop "${CONTAINER_NAME}"
-    docker rm "${CONTAINER_NAME}"
+    docker stop "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    docker rm "${CONTAINER_NAME}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
-# Parse VLLM_HOST_IP from additional args if present.
-# This is needed for multi-NIC configurations where Ray needs explicit IP bindings.
+# Parse VLLM_HOST_IP from additional args if given as: -e VLLM_HOST_IP=1.2.3.4
 VLLM_HOST_IP=""
-for arg in "${ADDITIONAL_ARGS[@]}"; do
-    if [[ $arg == "-e" ]]; then
-        continue
-    fi
-    if [[ $arg == VLLM_HOST_IP=* ]]; then
+for ((i=0;i<${#ADDITIONAL_ARGS[@]};i++)); do
+    arg="${ADDITIONAL_ARGS[i]}"
+    if [[ "${arg}" == "VLLM_HOST_IP="* ]] || [[ "${arg}" == "VLLM_HOST_IP"* ]]; then
         VLLM_HOST_IP="${arg#VLLM_HOST_IP=}"
-        break
+        # If the user passed it with a preceding -e, we may have -e then VLLM_HOST_IP=...; handle that:
+    fi
+    if [[ "${arg}" == "-e" && $((i+1)) -lt ${#ADDITIONAL_ARGS[@]} ]]; then
+        next="${ADDITIONAL_ARGS[i+1]}"
+        if [[ "${next}" == VLLM_HOST_IP=* ]]; then
+            VLLM_HOST_IP="${next#VLLM_HOST_IP=}"
+        fi
     fi
 done
 
-# Build the Ray start command based on the node role.
-# The head node manages the cluster and accepts connections on port 6379, 
-# while workers connect to the head's address.
+# Fall back to an env var if user exported it to shell
+if [ -z "${VLLM_HOST_IP}" ] && [ -n "${VLLM_HOST_IP:-}" ]; then
+    VLLM_HOST_IP="${VLLM_HOST_IP}"
+fi
+
+# Ray start command
 RAY_START_CMD="ray start --block"
 if [ "${NODE_TYPE}" == "--head" ]; then
-    RAY_START_CMD+=" --head --port=6379 --node-ip-address=${VLLM_HOST_IP}"
+    RAY_START_CMD+=" --head --port=6379"
+    if [ -n "${VLLM_HOST_IP}" ]; then
+        RAY_START_CMD+=" --node-ip-address=${VLLM_HOST_IP}"
+    fi
 else
-    RAY_START_CMD+=" --address=${HEAD_NODE_ADDRESS}:6379 --node-ip-address=${VLLM_HOST_IP}"
+    RAY_START_CMD+=" --address=${HEAD_NODE_ADDRESS}:6379"
+    if [ -n "${VLLM_HOST_IP}" ]; then
+        RAY_START_CMD+=" --node-ip-address=${VLLM_HOST_IP}"
+    fi
 fi
 
-
-
-# Build Ray IP environment variables if VLLM_HOST_IP is set.
-# These variables ensure Ray binds to the correct network interface on multi-NIC systems.
-RAY_IP_VARS=()
+# Build docker env args
+DOCKER_ENV_ARGS=()
 if [ -n "${VLLM_HOST_IP}" ]; then
-    RAY_IP_VARS=(
-        -e "RAY_NODE_IP_ADDRESS=${VLLM_HOST_IP}"
-        -e "RAY_OVERRIDE_NODE_IP_ADDRESS=${VLLM_HOST_IP}"
-    )
+    DOCKER_ENV_ARGS+=( -e "RAY_NODE_IP_ADDRESS=${VLLM_HOST_IP}" -e "RAY_OVERRIDE_NODE_IP_ADDRESS=${VLLM_HOST_IP}" )
 fi
 
-# Launch the container with the assembled parameters.
-# --network host: Allows Ray nodes to communicate directly via host networking
-# --shm-size 10.24g: Increases shared memory
-# --gpus all: Gives container access to all GPUs on the host
-# -v HF_HOME: Mounts HuggingFace cache to avoid re-downloading models
+# Auto-detect network interface to set NCCL/GLOO envs (optional but helpful)
+IFACE=""
+if [ -n "${VLLM_HOST_IP}" ]; then
+    # Attempt to detect the interface used to reach VLLM_HOST_IP; fallback to first non-loopback
+    IFACE=$(ip route get "${VLLM_HOST_IP}" 2>/dev/null | awk -F 'dev ' '{print $2}' | awk '{print $1}' || true)
+    if [ -z "${IFACE}" ]; then
+        IFACE=$(ip -o -4 addr show scope global | awk '{print $2; exit}')
+    fi
+fi
+
+if [ -n "${IFACE}" ]; then
+    DOCKER_ENV_ARGS+=( -e "NCCL_SOCKET_IFNAME=${IFACE}" -e "GLOO_SOCKET_IFNAME=${IFACE}" -e "GLOO_DEVICE_TRANSPORT=tcp" )
+fi
+
+# If VLLM_HOST_IP is provided, add a container-only hosts mapping so hostname resolves to LAN IP inside container
+DOCKER_ADD_HOST_ARGS=()
+if [ -n "${VLLM_HOST_IP}" ]; then
+    HOSTNAME_ON_HOST=$(hostname)
+    DOCKER_ADD_HOST_ARGS+=( --add-host "${HOSTNAME_ON_HOST}:${VLLM_HOST_IP}" )
+fi
+
+# Compose and run docker
+echo "Starting container ${CONTAINER_NAME} from image ${DOCKER_IMAGE}"
+echo "Mapped HF cache: ${PATH_TO_HF_HOME} -> /root/.cache/huggingface"
+
 docker run \
     --entrypoint /bin/bash \
     --network host \
@@ -120,6 +114,7 @@ docker run \
     --shm-size 10.24g \
     --gpus all \
     -v "${PATH_TO_HF_HOME}:/root/.cache/huggingface" \
-    "${RAY_IP_VARS[@]}" \
+    "${DOCKER_ADD_HOST_ARGS[@]}" \
+    "${DOCKER_ENV_ARGS[@]}" \
     "${ADDITIONAL_ARGS[@]}" \
     "${DOCKER_IMAGE}" -c "/bin/bash -lc \"${RAY_START_CMD}\""
