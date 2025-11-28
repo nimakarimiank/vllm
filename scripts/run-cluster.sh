@@ -73,9 +73,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Build the Ray start command based on the node role.
+# The head node manages the cluster and accepts connections on port 6379, 
+# while workers connect to the head's address.
+RAY_START_CMD="ray start --block"
+if [ "${NODE_TYPE}" == "--head" ]; then
+    RAY_START_CMD+=" --head --port=6379"
+else
+    RAY_START_CMD+=" --address=${HEAD_NODE_ADDRESS}:6379"
+fi
+
 # Parse VLLM_HOST_IP from additional args if present.
 # This is needed for multi-NIC configurations where Ray needs explicit IP bindings.
 VLLM_HOST_IP=""
+AUTO_SERVE_SCRIPT=""
 for arg in "${ADDITIONAL_ARGS[@]}"; do
     if [[ $arg == "-e" ]]; then
         continue
@@ -84,19 +95,10 @@ for arg in "${ADDITIONAL_ARGS[@]}"; do
         VLLM_HOST_IP="${arg#VLLM_HOST_IP=}"
         break
     fi
+    if [[ $arg == AUTO_SERVE_SCRIPT=* ]]; then
+        AUTO_SERVE_SCRIPT="${arg#AUTO_SERVE_SCRIPT=}"
+    fi
 done
-
-# Build the Ray start command based on the node role.
-# The head node manages the cluster and accepts connections on port 6379, 
-# while workers connect to the head's address.
-RAY_START_CMD="ray start --block"
-if [ "${NODE_TYPE}" == "--head" ]; then
-    RAY_START_CMD+=" --head --port=6379 --node-ip-address=${VLLM_HOST_IP}"
-else
-    RAY_START_CMD+=" --address=${HEAD_NODE_ADDRESS}:6379 --node-ip-address=${VLLM_HOST_IP}"
-fi
-
-
 
 # Build Ray IP environment variables if VLLM_HOST_IP is set.
 # These variables ensure Ray binds to the correct network interface on multi-NIC systems.
@@ -107,6 +109,50 @@ if [ -n "${VLLM_HOST_IP}" ]; then
         -e "RAY_OVERRIDE_NODE_IP_ADDRESS=${VLLM_HOST_IP}"
     )
 fi
+#############################################
+# Detect correct network interface for NCCL/GLOO
+#############################################
+NCCL_IFACE="enp4s0"
+GLOO_IFACE="enp4s0"
+
+# # If user already set NCCL/GLOO interface, respect it
+# for arg in "${ADDITIONAL_ARGS[@]}"; do
+#     if [[ $arg == "-e" ]]; then
+#         continue
+#     fi
+#     if [[ $arg == NCCL_SOCKET_IFNAME=* ]]; then
+#         NCCL_IFACE="${arg#NCCL_SOCKET_IFNAME=}"
+#     fi
+#     if [[ $arg == GLOO_SOCKET_IFNAME=* ]]; then
+#         GLOO_IFACE="${arg#GLOO_SOCKET_IFNAME=}"
+#     fi
+# done
+
+# # Auto-detect only if not manually set
+# if [ -z "$NCCL_IFACE" ]; then
+#     NCCL_IFACE=$(ip -o -4 route get "$VLLM_HOST_IP" | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+# fi
+# if [ -z "$GLOO_IFACE" ]; then
+#     GLOO_IFACE="$NCCL_IFACE"
+# fi
+
+echo "Using NCCL interface: $NCCL_IFACE"
+echo "Using GLOO interface: $GLOO_IFACE"
+
+DIST_IFACE_ENV=(
+    -e "NCCL_SOCKET_IFNAME=${NCCL_IFACE}"
+    -e "GLOO_SOCKET_IFNAME=${GLOO_IFACE}"
+    -e "GLOO_DEVICE_TRANSPORT=tcp"
+)
+
+# If this is the head node and an AUTO_SERVE_SCRIPT environment variable was provided
+# (e.g. via: -e AUTO_SERVE_SCRIPT=/app/ray_serve.py) then automatically launch the
+# Ray Serve application after the Ray head process starts. NOTE: This will start
+# the serve script immediately; for multi-GPU tensor parallel loading you should
+# ensure worker nodes are already up, otherwise the model may only use the head GPU.
+if [ "${NODE_TYPE}" == "--head" ] && [ -n "${AUTO_SERVE_SCRIPT}" ]; then
+    RAY_START_CMD="ray start --head --port=6379 && python3 ${AUTO_SERVE_SCRIPT}"
+fi
 
 # Launch the container with the assembled parameters.
 # --network host: Allows Ray nodes to communicate directly via host networking
@@ -116,10 +162,13 @@ fi
 docker run \
     --entrypoint /bin/bash \
     --network host \
+    --runtime nvidia \
     --name "${CONTAINER_NAME}" \
     --shm-size 10.24g \
+    --ipc=host \
     --gpus all \
     -v "${PATH_TO_HF_HOME}:/root/.cache/huggingface" \
     "${RAY_IP_VARS[@]}" \
+    "${DIST_IFACE_ENV[@]}" \
     "${ADDITIONAL_ARGS[@]}" \
-    "${DOCKER_IMAGE}" -c "/bin/bash -lc \"${RAY_START_CMD}\""
+    "${DOCKER_IMAGE}" -c "${RAY_START_CMD}"
