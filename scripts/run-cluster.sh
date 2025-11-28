@@ -141,8 +141,10 @@ echo "Using GLOO interface: $GLOO_IFACE"
 
 DIST_IFACE_ENV=(
     -e "NCCL_SOCKET_IFNAME=${NCCL_IFACE}"
+    -e "NCCL_DEBUG=INFO"
+    -e "NCCL_SOCKET_NTHREADS=4"
+    -e "TORCH_DISTRIBUTED_DEFAULT_BACKEND=nccl"
     -e "GLOO_SOCKET_IFNAME=${GLOO_IFACE}"
-    -e "GLOO_DEVICE_TRANSPORT=tcp"
 )
 
 # If this is the head node and an AUTO_SERVE_SCRIPT environment variable was provided
@@ -160,9 +162,9 @@ fi
 # --gpus all: Gives container access to all GPUs on the host
 # -v HF_HOME: Mounts HuggingFace cache to avoid re-downloading models
 docker run \
+    --runtime nvidia \
     --entrypoint /bin/bash \
     --network host \
-    --runtime nvidia \
     --name "${CONTAINER_NAME}" \
     --shm-size 10.24g \
     --ipc=host \
