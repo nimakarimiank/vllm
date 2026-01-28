@@ -26,7 +26,7 @@ Helper utilities for launching and operating **vLLM** Ray clusters live here. Th
 ## Step 1 – Prepare the Hugging Face cache path
 1. Pick an absolute directory on every machine (for example `/data/hf-cache`).
 2. Ensure it is writable by the user running Docker.
-3. Populate it with any pre-downloaded models you need, or let vLLM download on demand (the directory is mounted into the container as `/root/.cache/huggingface`).
+3. Populate it with any pre-downloaded models you need, or let vLLM download on demand (the directory lives on the host/head node and is bind-mounted into the container as `/root/.cache/huggingface`, so the data never resides inside the container image itself).
 
 ---
 
