@@ -1,99 +1,102 @@
 #!/bin/bash
-set -euo pipefail
+# vLLM Ray cluster launcher (see scripts/README.md for full workflow).
 
+# Step 1: Validate required arguments.
 if [ $# -lt 4 ]; then
     echo "Usage: $0 docker_image head_node_ip --head|--worker path_to_hf_home [additional_args...]"
     exit 1
 fi
 
+# Step 2: Extract the mandatory positional arguments.
 DOCKER_IMAGE="$1"
 HEAD_NODE_ADDRESS="$2"
 NODE_TYPE="$3"
 PATH_TO_HF_HOME="$4"
 shift 4
+
+# Step 3: Preserve extra Docker arguments.
 ADDITIONAL_ARGS=("$@")
 
+# Step 4: Validate the node role flag.
 if [ "${NODE_TYPE}" != "--head" ] && [ "${NODE_TYPE}" != "--worker" ]; then
     echo "Error: Node type must be --head or --worker"
     exit 1
 fi
 
-if [[ "${PATH_TO_HF_HOME}" != /* ]]; then
-    echo "Error: path_to_hf_home must be absolute. Got: ${PATH_TO_HF_HOME}"
-    exit 1
-fi
-
+# Step 5: Allocate a unique container name per launch.
 CONTAINER_NAME="node-${RANDOM}"
-cleanup() { docker stop "${CONTAINER_NAME}" >/dev/null 2>&1 || true; docker rm "${CONTAINER_NAME}" >/dev/null 2>&1 || true; }
+
+# Step 6: Ensure the container is removed on exit.
+cleanup() {
+    docker stop "${CONTAINER_NAME}"
+    docker rm "${CONTAINER_NAME}"
+}
 trap cleanup EXIT
 
-# Parse VLLM_HOST_IP from additional args if supplied using -e VLLM_HOST_IP=...
-VLLM_HOST_IP=""
-for ((i=0;i<${#ADDITIONAL_ARGS[@]};i++)); do
-    arg="${ADDITIONAL_ARGS[i]}"
-    if [[ "${arg}" == "-e" && $((i+1)) -lt ${#ADDITIONAL_ARGS[@]} ]]; then
-        next="${ADDITIONAL_ARGS[i+1]}"
-        if [[ "${next}" == VLLM_HOST_IP=* ]]; then
-            VLLM_HOST_IP="${next#VLLM_HOST_IP=}"
-        fi
-    elif [[ "${arg}" == VLLM_HOST_IP=* ]]; then
-        VLLM_HOST_IP="${arg#VLLM_HOST_IP=}"
-    fi
-done
-
+# Step 7: Build the Ray start command for the chosen role.
 RAY_START_CMD="ray start --block"
 if [ "${NODE_TYPE}" == "--head" ]; then
     RAY_START_CMD+=" --head --port=6379"
-    [ -n "${VLLM_HOST_IP}" ] && RAY_START_CMD+=" --node-ip-address=${VLLM_HOST_IP}"
 else
     RAY_START_CMD+=" --address=${HEAD_NODE_ADDRESS}:6379"
-    [ -n "${VLLM_HOST_IP}" ] && RAY_START_CMD+=" --node-ip-address=${VLLM_HOST_IP}"
 fi
 
-DOCKER_ENV_ARGS=()
-if [ -n "${VLLM_HOST_IP}" ]; then
-    DOCKER_ENV_ARGS+=( -e "RAY_NODE_IP_ADDRESS=${VLLM_HOST_IP}" -e "RAY_OVERRIDE_NODE_IP_ADDRESS=${VLLM_HOST_IP}" )
-fi
-
-# Auto-detect interface (attempt). Validate it is an interface name, not an IP.
-IFACE=""
-if [ -n "${VLLM_HOST_IP}" ]; then
-    IFACE=$(ip route get "${VLLM_HOST_IP}" 2>/dev/null | sed -n 's/.* dev \([[:alnum:]][_[:alnum:]\.:+-]*\).*/\1/p' || true)
-    if [ -z "${IFACE}" ]; then
-        IFACE=$(ip -o -4 addr show scope global | awk '{print $2; exit}' || true)
+# Step 8: Parse optional env settings forwarded via -e.
+VLLM_HOST_IP=""
+AUTO_SERVE_SCRIPT=""
+for arg in "${ADDITIONAL_ARGS[@]}"; do
+    if [[ $arg == "-e" ]]; then
+        continue
     fi
-fi
-
-# Validate IFACE: must NOT look like an IPv4 address and must be non-empty.
-if [ -n "${IFACE}" ]; then
-    if [[ "${IFACE}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        echo "Detected IFACE looks like an IP (${IFACE}). Ignoring IFACE to avoid passing an IP to GLOO/NCCL."
-        IFACE=""
+    if [[ $arg == VLLM_HOST_IP=* ]]; then
+        VLLM_HOST_IP="${arg#VLLM_HOST_IP=}"
+        break
     fi
-fi
+    if [[ $arg == AUTO_SERVE_SCRIPT=* ]]; then
+        AUTO_SERVE_SCRIPT="${arg#AUTO_SERVE_SCRIPT=}"
+    fi
+done
 
-if [ -n "${IFACE}" ]; then
-    echo "Using network interface: ${IFACE}"
-    DOCKER_ENV_ARGS+=( -e "NCCL_SOCKET_IFNAME=${IFACE}" -e "GLOO_SOCKET_IFNAME=${IFACE}" -e "GLOO_DEVICE_TRANSPORT=tcp" )
-else
-    echo "No valid network interface detected; not setting NCCL/GLOO interface envs (allow auto-detect)."
-fi
-
-DOCKER_ADD_HOST_ARGS=()
+# Step 9: Align Ray IP bindings when VLLM_HOST_IP is supplied.
+RAY_IP_VARS=()
 if [ -n "${VLLM_HOST_IP}" ]; then
-    HOSTNAME_ON_HOST=$(hostname)
-    DOCKER_ADD_HOST_ARGS+=( --add-host "${HOSTNAME_ON_HOST}:${VLLM_HOST_IP}" )
+    RAY_IP_VARS=(
+        -e "RAY_NODE_IP_ADDRESS=${VLLM_HOST_IP}"
+        -e "RAY_OVERRIDE_NODE_IP_ADDRESS=${VLLM_HOST_IP}"
+    )
 fi
 
-echo "Starting container ${CONTAINER_NAME} from image ${DOCKER_IMAGE}"
+# Step 10: Program NCCL/GLOO defaults (overrides remain available via -e flags).
+NCCL_IFACE="enp4s0"
+GLOO_IFACE="enp4s0"
+
+echo "Using NCCL interface: $NCCL_IFACE"
+echo "Using GLOO interface: $GLOO_IFACE"
+
+DIST_IFACE_ENV=(
+    -e "NCCL_SOCKET_IFNAME=${NCCL_IFACE}"
+    -e "NCCL_DEBUG=INFO"
+    -e "NCCL_SOCKET_NTHREADS=4"
+    -e "TORCH_DISTRIBUTED_DEFAULT_BACKEND=nccl"
+    -e "GLOO_SOCKET_IFNAME=${GLOO_IFACE}"
+)
+
+# Step 11: Optionally chain a Serve script after the head starts.
+if [ "${NODE_TYPE}" == "--head" ] && [ -n "${AUTO_SERVE_SCRIPT}" ]; then
+    RAY_START_CMD="ray start --head --port=6379 && python3 ${AUTO_SERVE_SCRIPT}"
+fi
+
+# Step 12: Launch the container with the assembled parameters.
 docker run \
+    --runtime nvidia \
     --entrypoint /bin/bash \
     --network host \
     --name "${CONTAINER_NAME}" \
     --shm-size 10.24g \
+    --ipc=host \
     --gpus all \
     -v "${PATH_TO_HF_HOME}:/root/.cache/huggingface" \
-    "${DOCKER_ADD_HOST_ARGS[@]}" \
-    "${DOCKER_ENV_ARGS[@]}" \
+    "${RAY_IP_VARS[@]}" \
+    "${DIST_IFACE_ENV[@]}" \
     "${ADDITIONAL_ARGS[@]}" \
-    "${DOCKER_IMAGE}" -c "/bin/bash -lc \"${RAY_START_CMD}\""
+    "${DOCKER_IMAGE}" -c "${RAY_START_CMD}"
